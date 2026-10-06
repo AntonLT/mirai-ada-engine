@@ -180,8 +180,14 @@ class MiraiSDrafterMethod(UnquantizedLinearMethod):
     """The MTP drafter's bf16 layers as int8 weights with a per-row scale: half the memory and half the bytes each draft
     step reads, and int8 tensor cores. Drafts are verified, so this can only move the acceptance rate."""
 
+    def create_weights(self, layer, *args, **kwargs) -> None:
+        """The bf16 weights are staged in host memory and only their int8 form reaches the GPU, so loading a drafter
+        never needs room for its bf16 copy (1.9B parameters for DFlash 2: 3.8 GB, more than a 16 GB card has left)."""
+        with torch.device("cpu"):
+            super().create_weights(layer, *args, **kwargs)
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        weight = layer.weight.data.float()
+        weight = layer.weight.data.to(torch.device("cuda", torch.cuda.current_device())).float()
         rows, columns = weight.shape
         assert rows % 8 == 0 and columns % 8 == 0, "torch._int_mm and w8_quantize take multiples of 8"
         scale = weight.abs().amax(dim=1).clamp_min(1e-12) / 127
@@ -215,3 +221,78 @@ class MiraiSHeadMethod(QuantizeMethodBase):
 
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
         raise AssertionError("the head is never used as an input embedding (Qwen3.8 is untied)")
+
+
+# Drafters loaded as their own checkpoint (DFlash 2) get the MTP drafter's int8 linears through this method name:
+# `--speculative-config '{"method": "dflash", "model": ..., "quantization": "mirai_s_w8"}'`.
+@register_quantization_config("mirai_s_w8")
+class MiraiSW8Config(QuantizationConfig):
+    def __repr__(self) -> str:
+        return "MiraiSW8Config()"
+
+    @classmethod
+    def get_name(cls) -> str:
+        return "mirai_s_w8"
+
+    @classmethod
+    def get_supported_act_dtypes(cls) -> list[torch.dtype]:
+        return [torch.bfloat16]
+
+    @classmethod
+    def get_min_capability(cls) -> int:
+        return 80
+
+    @staticmethod
+    def get_config_filenames() -> list[str]:
+        return []
+
+    @classmethod
+    def from_config(cls, config: dict) -> "MiraiSW8Config":
+        return cls()
+
+    def get_quant_method(self, layer: torch.nn.Module, prefix: str):
+        return MiraiSDrafterMethod() if isinstance(layer, LinearBase) else None
+
+
+class MiraiSDrafterW4Method(UnquantizedLinearMethod):
+    """A separately loaded drafter's linears as 4-bit weights (round-to-nearest, groups of 128) run by vLLM's Marlin
+    W4A16 kernel: a quarter of the bf16 bytes each draft step reads. Drafts are verified, so this can only move the
+    acceptance rate."""
+
+    def create_weights(self, layer, *args, **kwargs) -> None:
+        with torch.device("cpu"):  # see MiraiSDrafterMethod.create_weights
+            super().create_weights(layer, *args, **kwargs)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        from vllm.model_executor.layers.quantization.utils.marlin_utils import (marlin_make_empty,
+                                                                                marlin_make_workspace_new)
+        from vllm.model_executor.layers.quantization.utils.marlin_utils_test import marlin_quantize
+        from vllm.scalar_type import scalar_types
+
+        device = torch.device("cuda", torch.cuda.current_device())
+        weight = layer.weight.data.to(device)
+        layer.w4_out, layer.w4_in = weight.shape
+        _, layer.w4_weight, layer.w4_scale = marlin_quantize(weight.t().contiguous(), scalar_types.uint4b8, 128)
+        layer.w4_zp = marlin_make_empty(device)
+        layer.w4_workspace = marlin_make_workspace_new(device)
+        del layer.weight
+
+    def apply(self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
+        from vllm.model_executor.layers.quantization.utils.marlin_utils import apply_gptq_marlin_linear
+        from vllm.scalar_type import scalar_types
+
+        return apply_gptq_marlin_linear(x, layer.w4_weight, layer.w4_scale, layer.w4_zp, layer.w4_workspace,
+                                        scalar_types.uint4b8, layer.w4_out, layer.w4_in, bias=bias)
+
+
+@register_quantization_config("mirai_s_w4")
+class MiraiSW4Config(MiraiSW8Config):
+    def __repr__(self) -> str:
+        return "MiraiSW4Config()"
+
+    @classmethod
+    def get_name(cls) -> str:
+        return "mirai_s_w4"
+
+    def get_quant_method(self, layer: torch.nn.Module, prefix: str):
+        return MiraiSDrafterW4Method() if isinstance(layer, LinearBase) else None

@@ -1,0 +1,5 @@
+Metadata-Version: 2.4
+Name: mirai-s
+Version: 0.2.1+ada
+Summary: Mirai S vLLM plugin, Ada (sm_89) engine fork: DFlash2 drafter support and Ada-tuned kernels
+Requires-Python: >=3.10
