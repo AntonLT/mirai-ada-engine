@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mirai-s"
+version = "0.2.1+ada"
+description = "Mirai S vLLM plugin, Ada (sm_89) engine fork: DFlash2 drafter support and Ada-tuned kernels"
+requires-python = ">=3.10"
+
+[project.entry-points."vllm.general_plugins"]
+mirai_s = "mirai_s:register"
+
+[tool.setuptools.package-data]
+mirai_s = ["kernels.cu"]
