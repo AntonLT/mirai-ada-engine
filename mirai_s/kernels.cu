@@ -146,14 +146,30 @@ __device__ __forceinline__ void columns_body(const u16* __restrict__ x, const fl
     __shared__ float column[WIDTH];
     __shared__ float mix[ORDER];
     __shared__ float shared[32];
+    // The token's S x, staged with coalesced reads: the mix below walks it at a stride of ORDER, which straight from
+    // global memory cost every CTA ORDER uncoalesced passes over the row. signs are exactly +-1, so flipping the bf16
+    // sign bit is exact and the sums below are the ones bf16_to_float(x) * sign * mix gives.
+    __shared__ alignas(16) u32 flipped[N / 2];
     const int out = blockIdx.x;
     const size_t base = static_cast<size_t>(blockIdx.y) * N;
     if (threadIdx.x < ORDER) mix[threadIdx.x] = small_q[out * ORDER + threadIdx.x];
+    // 16-byte loads (8 values) keep a few independent reads in flight per thread instead of a serial chain.
+    const uint4* chunks = reinterpret_cast<const uint4*>(x + base);
+    const float4* sign_quads = reinterpret_cast<const float4*>(signs);
+#pragma unroll 4
+    for (int i = threadIdx.x; i < N / 8; i += blockDim.x) {
+        const uint4 chunk = __ldg(chunks + i);
+        const float4 low = __ldg(sign_quads + 2 * i), high = __ldg(sign_quads + 2 * i + 1);
+        const auto flip = [](float a, float b) { return (a < 0.0f ? 0x8000u : 0u) | (b < 0.0f ? 0x80000000u : 0u); };
+        reinterpret_cast<uint4*>(flipped)[i] = make_uint4(chunk.x ^ flip(low.x, low.y), chunk.y ^ flip(low.z, low.w),
+                                                          chunk.z ^ flip(high.x, high.y), chunk.w ^ flip(high.z, high.w));
+    }
     __syncthreads();
+    const u16* row = reinterpret_cast<const u16*>(flipped);
     for (int w = threadIdx.x; w < WIDTH; w += blockDim.x) {
         float value = 0.0f;
 #pragma unroll
-        for (int c = 0; c < ORDER; ++c) value += bf16_to_float(x[base + w * ORDER + c]) * signs[w * ORDER + c] * mix[c];
+        for (int c = 0; c < ORDER; ++c) value += bf16_to_float(row[w * ORDER + c]) * mix[c];
         column[w] = value;
     }
     __syncthreads();
@@ -481,7 +497,8 @@ __device__ __forceinline__ void mma_body(const uint4* __restrict__ packets, cons
                                          int packets_per_row, const float* __restrict__ rowscale,
                                          const uint2* __restrict__ q, int groups_per_token, int tokens,
                                          const float* __restrict__ stats, const float* __restrict__ codebook,
-                                         u16* __restrict__ y, int y_stride, const int* __restrict__ row_map) {
+                                         u16* __restrict__ y, int y_stride, const int* __restrict__ row_map,
+                                         int* __restrict__ split_sums) {
     constexpr bool PAIRED = NT == 64;
     constexpr int GROUPS = PAIRED ? 2 : 1, SLICES = MMA_WARPS / GROUPS;  // row groups per CTA, warps per row group
     constexpr int TILES = (PAIRED ? 32 : NT) / 8, PACKET_WORDS = STEPS * V / 4;  // a V2 T6 packet is two slabs
@@ -519,7 +536,9 @@ __device__ __forceinline__ void mma_body(const uint4* __restrict__ packets, cons
         }
     };
 
-    for (int packet = warp % SLICES; packet < packets_per_row; packet += SLICES) {
+    // Split-K (grid.z > 1, NT < 64): CTA z takes every gridDim.z-th run of SLICES packets and adds its exact int32
+    // sums into split_sums ([2 * tokens][rows], prefill_output's layout), which prefill_output then finishes.
+    for (int packet = blockIdx.z * SLICES + warp % SLICES; packet < packets_per_row; packet += SLICES * gridDim.z) {
         const size_t slot = group * packets_per_row + packet;
         u32 bits[4 * WORDS];
         load_packet<WORDS>(packets, slot, lane, bits);
@@ -563,9 +582,16 @@ __device__ __forceinline__ void mma_body(const uint4* __restrict__ packets, cons
             const int t = i / 32, r = i % 32, token = first_token + t;
             const size_t row = (blockIdx.x * GROUPS + round) * 32 + r;
             const int column = row_map[row];
-            if (token < tokens && column >= 0)
-                y[static_cast<size_t>(token) * y_stride + column] =
-                    output_value(sums[0][t][r], sums[1][t][r], stats + token * 8, codebook, rowscale[row]);
+            if (token < tokens && column >= 0) {
+                if (split_sums != nullptr) {
+                    const size_t rows = static_cast<size_t>(gridDim.x) * GROUPS * 32;
+                    atomicAdd(split_sums + static_cast<size_t>(token) * rows + row, sums[0][t][r]);
+                    atomicAdd(split_sums + static_cast<size_t>(tokens + token) * rows + row, sums[1][t][r]);
+                } else {
+                    y[static_cast<size_t>(token) * y_stride + column] =
+                        output_value(sums[0][t][r], sums[1][t][r], stats + token * 8, codebook, rowscale[row]);
+                }
+            }
             sums[0][t][r] = sums[1][t][r] = 0;
         }
     }
@@ -575,9 +601,9 @@ __device__ __forceinline__ void mma_body(const uint4* __restrict__ packets, cons
     extern "C" __global__ void __launch_bounds__(32 * MMA_WARPS, 2)                                                   \
         NAME(const uint4* packets, const ENTRY* entries, int packets_per_row, const float* rowscale, const uint2* q,    \
              int groups_per_token, int tokens, const float* stats, const float* codebook, u16* y, int y_stride,       \
-             const int* row_map) {                                                                                    \
+             const int* row_map, int* split_sums) {                                                                   \
         mma_body<V, T, STEPS, WORDS, ENTRY, NT>(packets, entries, packets_per_row, rowscale, q, groups_per_token,      \
-                                                tokens, stats, codebook, y, y_stride, row_map);                       \
+                                                tokens, stats, codebook, y, y_stride, row_map, split_sums);           \
     }
 #define MMA_ALL_NT(PREFIX, V, T, STEPS, WORDS, ENTRY) \
     MMA(PREFIX##_n8, V, T, STEPS, WORDS, ENTRY, 8)    \

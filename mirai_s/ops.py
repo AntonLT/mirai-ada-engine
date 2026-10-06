@@ -94,6 +94,7 @@ def quantize(x: torch.Tensor, layer: Layer) -> tuple[torch.Tensor, torch.Tensor]
         kernel(f"transform_words_{columns}")(grid=(tokens, 1, 1), block=(512, 1, 1),
                                              args=[x, layer.signs, layer.small_q, q, stats])
         return q, stats
+    assert x.data_ptr() % 16 == 0, "rotate_columns reads the activations 16 bytes at a time"
     order = layer.small_q.shape[0]
     rotated = torch.empty(tokens, columns, dtype=torch.float32, device=x.device)
     column_max = torch.empty(tokens, order, dtype=torch.float32, device=x.device)
@@ -132,9 +133,18 @@ def linear(x: torch.Tensor, layer: Layer) -> torch.Tensor:
         elif tokens <= MMA_TOKENS:  # an n64 CTA takes 64 rows: in_proj_ba's 96 get two 32-token tiles instead
             tile = 8 if tokens <= 8 else 16 if tokens <= 16 else 32 if tokens <= 32 or block.rows % 64 else 64
             rows_per_cta = 64 if tile == 64 else 32
-            kernel(f"mma_{block.format}_n{tile}")(grid=(block.rows // rows_per_cta, -(-tokens // tile), 1),
-                                                  block=(MMA_THREADS, 1, 1),
-                                                  args=tape + [block.rowscale, q, block.columns // 4, tokens] + epilogue)
+            token_tiles = -(-tokens // tile)
+            splits = split_count(block, tile, token_tiles, x.device)
+            mma = kernel(f"mma_{block.format}_n{tile}")
+            grid = (block.rows // rows_per_cta, token_tiles, splits)
+            args = tape + [block.rowscale, q, block.columns // 4, tokens] + epilogue
+            if splits == 1:
+                mma(grid=grid, block=(MMA_THREADS, 1, 1), args=args + [null_pointer(x.device)])
+            else:
+                sums = torch.zeros(2 * tokens, block.rows, dtype=torch.int32, device=x.device)
+                mma(grid=grid, block=(MMA_THREADS, 1, 1), args=args + [sums])
+                kernel("prefill_output")(grid=(-(-block.rows // 256), tokens, 1), block=(256, 1, 1),
+                                         args=[sums, tokens, block.rows, block.rowscale] + epilogue)
         else:
             levels = torch.empty(block.rows, block.columns, dtype=torch.int8, device=x.device)
             kernel(f"levels_{block.format}")(grid=(block.rows // 32, 1, 1), block=(GEMV_THREADS, 1, 1),
@@ -143,6 +153,44 @@ def linear(x: torch.Tensor, layer: Layer) -> torch.Tensor:
             kernel("prefill_output")(grid=(-(-block.rows // 256), tokens, 1), block=(256, 1, 1),
                                      args=[products, tokens, block.rows, block.rowscale] + epilogue)
     return out
+
+
+@cache
+def null_pointer(device: torch.device) -> torch.Tensor:
+    """A pointer argument of 0 (torch's kernel launcher passes tensors as pointers and has no None)."""
+    empty = torch.empty(0, dtype=torch.int32, device=device)
+    assert empty.data_ptr() == 0
+    return empty
+
+
+@cache
+def resident_ctas(name: str, device: torch.device) -> int:
+    """How many CTAs of a kernel the whole GPU runs at once."""
+    import ctypes
+
+    blocks = ctypes.c_int()
+    driver = ctypes.CDLL("libcuda.so.1")
+    status = driver.cuOccupancyMaxActiveBlocksPerMultiprocessor(ctypes.byref(blocks), kernel(name).func, MMA_THREADS, 0)
+    assert status == 0, f"occupancy query failed for {name}: {status}"
+    return blocks.value * torch.cuda.get_device_properties(device).multi_processor_count
+
+
+SPLIT_WAVES = 2  # a split launch fills the GPU about this many times over
+MAX_SPLITS = 6
+
+
+def split_count(block: Block, tile: int, token_tiles: int, device: torch.device) -> int:
+    """Split-K factor for one mma launch. A launch with fewer CTAs than the GPU holds at once (5120-row layers: 160
+    CTAs; in_proj_ba: 3) leaves SMs idle, the more so the fewer SMs there are (66 on an RTX 4070 Ti SUPER); splitting
+    the columns across CTAs fills them. Launches that already fill a wave only lose to the extra epilogue (measured on
+    that card). Sums are exact int32, so any split gives bit-identical output."""
+    if tile == 64:  # paired warps walk packets 2i and 2i + 1 together
+        return 1
+    ctas, resident = block.rows // 32 * token_tiles, resident_ctas(f"mma_{block.format}_n{tile}", device)
+    if ctas * 20 >= resident * 17:  # at least 85% of one wave already
+        return 1
+    most = min(MAX_SPLITS, max(1, block.packets_per_row // 8))  # at least one packet per warp and split
+    return max(1, min(-(-SPLIT_WAVES * resident // ctas), most))
 
 
 # torch.compile and CUDA graphs see one opaque op; the layers live in a registry indexed by an int.
