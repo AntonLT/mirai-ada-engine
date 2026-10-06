@@ -139,7 +139,7 @@ __device__ __forceinline__ float block_max(float value, float* shared) {
 }
 
 template <int WIDTH, int ORDER>
-__device__ __forceinline__ void columns_body(const u16* __restrict__ x, const float* __restrict__ signs,
+__device__ __forceinline__ void columns_body(const u16* __restrict__ x, const u32* __restrict__ sign_bits,
                                              const float* __restrict__ small_q, float* __restrict__ rotated,
                                              float* __restrict__ column_max) {
     constexpr int N = WIDTH * ORDER;
@@ -153,16 +153,18 @@ __device__ __forceinline__ void columns_body(const u16* __restrict__ x, const fl
     const int out = blockIdx.x;
     const size_t base = static_cast<size_t>(blockIdx.y) * N;
     if (threadIdx.x < ORDER) mix[threadIdx.x] = small_q[out * ORDER + threadIdx.x];
-    // 16-byte loads (8 values) keep a few independent reads in flight per thread instead of a serial chain.
+    // 16-byte loads (8 values) keep a few independent reads in flight per thread instead of a serial chain. The signs
+    // come as a bitmask (bit j of word i: value 32 i + j is negated), 1/32 of the float array every CTA would re-read.
     const uint4* chunks = reinterpret_cast<const uint4*>(x + base);
-    const float4* sign_quads = reinterpret_cast<const float4*>(signs);
 #pragma unroll 4
     for (int i = threadIdx.x; i < N / 8; i += blockDim.x) {
         const uint4 chunk = __ldg(chunks + i);
-        const float4 low = __ldg(sign_quads + 2 * i), high = __ldg(sign_quads + 2 * i + 1);
-        const auto flip = [](float a, float b) { return (a < 0.0f ? 0x8000u : 0u) | (b < 0.0f ? 0x80000000u : 0u); };
-        reinterpret_cast<uint4*>(flipped)[i] = make_uint4(chunk.x ^ flip(low.x, low.y), chunk.y ^ flip(low.z, low.w),
-                                                          chunk.z ^ flip(high.x, high.y), chunk.w ^ flip(high.z, high.w));
+        const u32 bits = (__ldg(sign_bits + i / 4) >> (8 * (i % 4))) & 0xFFu;
+        const auto flip = [bits](int pair) {
+            return ((bits >> (2 * pair)) & 1u) * 0x8000u | ((bits >> (2 * pair + 1)) & 1u) * 0x80000000u;
+        };
+        reinterpret_cast<uint4*>(flipped)[i] =
+            make_uint4(chunk.x ^ flip(0), chunk.y ^ flip(1), chunk.z ^ flip(2), chunk.w ^ flip(3));
     }
     __syncthreads();
     const u16* row = reinterpret_cast<const u16*>(flipped);
@@ -243,9 +245,9 @@ __device__ __forceinline__ void quantize_rows_body(const float* __restrict__ rot
 }
 
 #define SPLIT_ROTATE(N, WIDTH, ORDER)                                                                               \
-    extern "C" __global__ void rotate_columns_##N(const u16* x, const float* signs, const float* small_q,            \
+    extern "C" __global__ void rotate_columns_##N(const u16* x, const u32* sign_bits, const float* small_q,         \
                                                   float* rotated, float* column_max) {                               \
-        columns_body<WIDTH, ORDER>(x, signs, small_q, rotated, column_max);                                           \
+        columns_body<WIDTH, ORDER>(x, sign_bits, small_q, rotated, column_max);                                       \
     }                                                                                                                \
     extern "C" __global__ void quantize_rows_##N(const float* rotated, const float* column_max, uint2* q,            \
                                                  float* stats) {                                                     \

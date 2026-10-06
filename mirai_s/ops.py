@@ -75,6 +75,18 @@ class Layer:
     signs: torch.Tensor
     small_q: torch.Tensor
     out_features: int
+    sign_bits: torch.Tensor = None  # signs < 0 packed 32 to an int32 word, for rotate_columns (see sign_bitmask)
+
+    def __post_init__(self) -> None:
+        if self.sign_bits is None:
+            object.__setattr__(self, "sign_bits", sign_bitmask(self.signs))
+
+
+def sign_bitmask(signs: torch.Tensor) -> torch.Tensor:
+    """Bit j of word i is set when signs[32 i + j] < 0 (the rotation signs are exactly +-1)."""
+    assert signs.numel() % 32 == 0 and bool(((signs == 1) | (signs == -1)).all()), "signs must be +-1"
+    bits = (signs < 0).view(-1, 32).to(torch.int64) << torch.arange(32, device=signs.device)
+    return bits.sum(dim=1).to(torch.int64).bitwise_and(0xFFFFFFFF).to(torch.uint32).view(torch.int32)
 
 
 def quantize(x: torch.Tensor, layer: Layer) -> tuple[torch.Tensor, torch.Tensor]:
@@ -100,7 +112,7 @@ def quantize(x: torch.Tensor, layer: Layer) -> tuple[torch.Tensor, torch.Tensor]
     column_max = torch.empty(tokens, order, dtype=torch.float32, device=x.device)
     width = columns // order
     kernel(f"rotate_columns_{columns}")(grid=(order, tokens, 1), block=(min(1024, width // 2), 1, 1),
-                                        args=[x, layer.signs, layer.small_q, rotated, column_max])
+                                        args=[x, layer.sign_bits, layer.small_q, rotated, column_max])
     kernel(f"quantize_rows_{columns}")(grid=(tokens, 1, 1), block=(1024, 1, 1), args=[rotated, column_max, q, stats])
     return q, stats
 
