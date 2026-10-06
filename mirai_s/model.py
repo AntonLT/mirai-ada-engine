@@ -11,7 +11,7 @@ from contextlib import contextmanager
 import torch
 from vllm.model_executor.models import qwen3_5, qwen3_5_mtp, qwen3_dflash, qwen3_dflash2
 
-from mirai_s.ops import HIDDEN, drafter_logits_op, embed_op
+from mirai_s.ops import HIDDEN, draft_vocab_logits_op, drafter_logits_op, embed_op
 from mirai_s.quant import MiraiSConfig, open_sidecar
 
 
@@ -99,6 +99,21 @@ class MiraiSDFlash2(qwen3_dflash2.DFlash2Qwen3ForCausalLM):
             return
         with shared_vocabulary(qwen3_dflash):
             super().__init__(vllm_config=vllm_config, prefix=prefix)
+
+    def compute_candidates(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Top-k candidates from the shared head's draft-vocabulary rows only (ops.DRAFT_VOCAB, as the MTP drafter
+        does): about a third of the full head's time each step. Drafts are verified, so this can only move the
+        acceptance rate."""
+        head = getattr(self.lm_head, "mirai_head", None)
+        if head is None:
+            return super().compute_candidates(hidden_states)
+        processor = self.candidate_logits_processor
+        values, ids = torch.topk(draft_vocab_logits_op(hidden_states, *head), self.model.candidate_selector.top_k)
+        if processor.scale != 1.0:
+            values = values * processor.scale
+        if processor.soft_cap is not None:
+            values = torch.tanh(values / processor.soft_cap) * processor.soft_cap
+        return ids.to(torch.int64), values
 
     def load_weights(self, weights):
         loaded = super().load_weights(weights)

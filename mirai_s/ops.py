@@ -320,3 +320,16 @@ def drafter_logits_op(x: torch.Tensor, codes: torch.Tensor, row_scales: torch.Te
 @drafter_logits_op.register_fake
 def _(x, codes, row_scales, ladder, ladder_indices, signs):
     return x.new_empty(x.shape[0], codes.shape[0], dtype=torch.float32)
+
+
+@torch.library.custom_op("mirai_s::draft_vocab_logits", mutates_args=())
+def draft_vocab_logits_op(x: torch.Tensor, codes: torch.Tensor, row_scales: torch.Tensor, ladder: torch.Tensor,
+                          ladder_indices: torch.Tensor, signs: torch.Tensor) -> torch.Tensor:
+    """fp32 logits over the draft vocabulary only, [tokens, DRAFT_VOCAB]: for drafters that pick their own top-k."""
+    out = torch.empty(x.shape[0], DRAFT_VOCAB, dtype=torch.float32, device=x.device)
+    return head_logits(x, codes, row_scales, ladder, ladder_indices, signs, [(0, DRAFT_VOCAB)], out)
+
+
+@draft_vocab_logits_op.register_fake
+def _(x, codes, row_scales, ladder, ladder_indices, signs):
+    return x.new_empty(x.shape[0], DRAFT_VOCAB, dtype=torch.float32)
