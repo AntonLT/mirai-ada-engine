@@ -3,6 +3,9 @@ def register() -> None:
     from vllm import ModelRegistry
 
     import mirai_s.quant  # noqa: F401
+    from mirai_s import kv_groups
+
+    kv_groups.apply()
 
     ModelRegistry.register_model("MiraiSQwen3_5ForCausalLM", "mirai_s.model:MiraiSQwen3_5ForCausalLM")
     # The MTP drafter class is looked up by this name; ours behaves exactly like vLLM's unless the model is mirai_s.
