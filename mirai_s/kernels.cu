@@ -25,10 +25,15 @@ typedef signed char s8;
 
 #define WARPS 16  // column slices per 32-row CTA
 
-__device__ __forceinline__ u32 fmix_hash(u32 state) {
+// fmix_hash before its final x ^ (x >> 16).
+__device__ __forceinline__ u32 fmix_unfinished(u32 state) {
     u32 x = state * 0xCFCCB83Fu + 0x584B4AA3u;
     x ^= x >> 16;
-    x *= 0x85EBCA6Bu;
+    return x * 0x85EBCA6Bu;
+}
+
+__device__ __forceinline__ u32 fmix_hash(u32 state) {
+    const u32 x = fmix_unfinished(state);
     return x ^ (x >> 16);
 }
 
@@ -88,9 +93,11 @@ __device__ __forceinline__ void decode_packet(const u32 (&bits)[4 * WORDS], u32 
 #pragma unroll
         for (int step = 0; step < STEPS; step += 2) {
             state = ((state << T) | symbol_at<T, WORDS>(bits, step)) & 0xFFFFu;
-            const u32 first = fmix_hash(state);
+            const u32 first = fmix_unfinished(state);
             state = ((state << T) | symbol_at<T, WORDS>(bits, step + 1)) & 0xFFFFu;
-            use(levels_plus_54(__byte_perm(first, fmix_hash(state), 0x5410)), step / 2);
+            const u32 second = fmix_unfinished(state);
+            // Bytes 0-1 of each finished hash are its low half xor its high half: both final xor-shifts in one xor.
+            use(levels_plus_54(__byte_perm(first, second, 0x5410) ^ __byte_perm(first, second, 0x7632)), step / 2);
         }
     }
 }
