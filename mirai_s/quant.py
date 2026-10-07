@@ -269,10 +269,14 @@ class MiraiSDrafterW4Method(UnquantizedLinearMethod):
         from vllm.model_executor.layers.quantization.utils.marlin_utils_test import marlin_quantize
         from vllm.scalar_type import scalar_types
 
+        # Quantize on the host: on the GPU the intermediates (bf16 reference, int32 codes) peak at several times the
+        # packed size while the target is already resident, which decided whether the server fit at all.
         device = torch.device("cuda", torch.cuda.current_device())
-        weight = layer.weight.data.to(device)
+        weight = layer.weight.data.cpu()
         layer.w4_out, layer.w4_in = weight.shape
-        _, layer.w4_weight, layer.w4_scale = marlin_quantize(weight.t().contiguous(), scalar_types.uint4b8, 128)
+        with torch.device("cpu"):  # the loader runs under a CUDA default device; keep the intermediates on the host
+            _, packed, scale = marlin_quantize(weight.t().contiguous(), scalar_types.uint4b8, 128)
+        layer.w4_weight, layer.w4_scale = packed.to(device), scale.to(device)
         layer.w4_zp = marlin_make_empty(device)
         layer.w4_workspace = marlin_make_workspace_new(device)
         del layer.weight
